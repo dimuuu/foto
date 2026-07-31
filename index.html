@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>foto</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #fff;
+    color: #000;
+    font: 13px/1.5 Arial, Helvetica, sans-serif;
+    height: 100vh;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  #stage {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    min-height: 0;
+  }
+  #canvas {
+    max-width: calc(100% - 48px);
+    max-height: calc(100% - 48px);
+    cursor: crosshair;
+    border: 1px solid #e0e0e0;
+  }
+  #drop {
+    position: absolute;
+    inset: 24px;
+    border: 1px solid #e0e0e0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    align-items: center;
+    justify-content: center;
+    color: #b0b0b0;
+    cursor: pointer;
+  }
+  #drop:hover, #drop.over { color: #000; }
+  #drop.hidden, #canvas.hidden { display: none; }
+  #marker {
+    position: absolute;
+    width: 14px; height: 14px;
+    pointer-events: none;
+    display: none;
+    transform: translate(-50%, -50%);
+  }
+  #marker::before, #marker::after {
+    content: '';
+    position: absolute;
+    background: rgba(255,255,255,.85);
+    mix-blend-mode: difference;
+  }
+  #marker::before { left: 6px; top: 0; width: 2px; height: 14px; }
+  #marker::after { left: 0; top: 6px; width: 14px; height: 2px; }
+  #overlay {
+    position: absolute;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0,0,0,.45);
+    color: #fff;
+    pointer-events: none;
+  }
+
+  #bar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 24px;
+    border-top: 1px solid #e0e0e0;
+    flex-shrink: 0;
+  }
+  #bar .hint { color: #b0b0b0; flex: 1; visibility: hidden; }
+  body.loaded #bar .hint { visibility: visible; }
+  button {
+    background: none;
+    border: none;
+    color: #000;
+    font: inherit;
+    padding: 0;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  button:hover { color: #b0b0b0; }
+  #file { display: none; }
+  .toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .toggle input { cursor: pointer; }
+  .toggle.busy { color: #b0b0b0; pointer-events: none; }
+  @keyframes pulse { 50% { opacity: .4; } }
+  .toggle.busy span { animation: pulse 1.2s ease-in-out infinite; }
+
+  @media (max-width: 600px) {
+    #drop { inset: 12px; }
+    #canvas { max-width: calc(100% - 24px); max-height: calc(100% - 24px); }
+    #bar {
+      flex-wrap: wrap;
+      gap: 10px 16px;
+      padding: 10px 16px;
+    }
+    #bar .hint { flex-basis: 100%; order: 4; }
+    body:not(.loaded) #bar .hint { display: none; }
+  }
+  /* the B key doesn't exist on touch devices */
+  @media (hover: none) and (pointer: coarse) {
+    #bar .hint { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <div id="drop">
+    <div>Drop an image here</div>
+    <div>Or click to choose a file</div>
+  </div>
+  <canvas id="canvas" class="hidden"></canvas>
+  <div id="marker"></div>
+  <div id="overlay">Click to set the point</div>
+</div>
+
+<div id="bar">
+  <div class="hint">Hold B to compare.</div>
+  <label class="toggle" id="bgToggle">
+    <input type="checkbox" id="removebg">
+    <span>Remove background</span>
+  </label>
+  <button id="restart">Restart</button>
+  <button id="save">Export</button>
+</div>
+<input type="file" id="file" accept="image/*">
+
+<script>
+// baked look
+const P = {
+  bw: 0.90,
+  contrast: 1.50,
+  lift: 0.10,
+  blur: 1.8,
+  aberration: 0.012,
+  spread: 3.0,
+  radial: 1.0,     // radial falloff of spread amount
+  angle: 0.0,      // horizontal tear
+  grain: 0.09,
+  grainsize: 1.0,
+};
+
+const VERT = `
+attribute vec2 a_pos;
+varying vec2 v_uv;
+void main() {
+  v_uv = a_pos * 0.5 + 0.5;
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
+
+const FRAG = `
+precision highp float;
+varying vec2 v_uv;
+uniform sampler2D u_image;
+uniform vec2 u_res;
+uniform vec2 u_center;
+uniform float u_seed;
+uniform float u_bypass;
+uniform float u_loading;   // 1 while the bg-removal model runs
+uniform float u_time;      // seconds, drives the loading scramble
+uniform float u_ampscale;  // scramble envelope, eases to 0 on finish
+
+const float BW = ${P.bw.toFixed(4)};
+const float CONTRAST = ${P.contrast.toFixed(4)};
+const float LIFT = ${P.lift.toFixed(4)};
+const float BLUR = ${P.blur.toFixed(4)};
+const float ABERRATION = ${P.aberration.toFixed(4)};
+const float SPREAD = ${P.spread.toFixed(4)};
+const float RADIAL = ${P.radial.toFixed(4)};
+const float ANGLE = ${P.angle.toFixed(4)};
+const float GRAIN = ${P.grain.toFixed(4)};
+const float GRAINSIZE = ${P.grainsize.toFixed(4)};
+
+float hash(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+// motion blur: gaussian-weighted line blur along the tear direction
+vec3 blurSample(vec2 uv) {
+  if (BLUR < 0.01) return texture2D(u_image, uv).rgb;
+  vec2 dir = vec2(cos(ANGLE), sin(ANGLE)) * BLUR / u_res;
+  vec3 c = vec3(0.0);
+  float wsum = 0.0;
+  for (int i = -4; i <= 4; i++) {
+    float w = exp(-float(i * i) * 0.18);
+    c += texture2D(u_image, uv + dir * float(i)).rgb * w;
+    wsum += w;
+  }
+  return c / wsum;
+}
+
+void main() {
+  vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+
+  if (u_bypass > 0.5) {
+    gl_FragColor = vec4(texture2D(u_image, uv).rgb, 1.0);
+    return;
+  }
+
+  // loading scramble: every pixel of the processed image gets a random
+  // isotropic displacement whose amplitude breathes — image tears apart
+  // into chaos and settles back, uniformly, with no direction or center
+  float seed = u_seed;
+  if (u_loading > 0.5) {
+    float frame = floor(u_time * 24.0);
+    float amp = (0.5 - 0.5 * cos(u_time * 2.6)) * 10.0 * u_ampscale;
+    vec2 scr = vec2(
+      hash(uv * u_res + vec2(31.7 + frame * 3.1, 7.3)),
+      hash(uv * u_res + vec2(11.1, 91.4 + frame * 5.7))
+    ) - 0.5;
+    uv = clamp(uv + scr * 2.0 * amp / u_res, 0.0, 1.0);
+    seed += frame * 7.31;
+  }
+
+  vec2 texel = 1.0 / u_res;
+  vec2 fromCenter = uv - u_center;
+  float dist = length(fromCenter);
+
+  // pixel spread: directional tear, amount grows with distance from point
+  float spreadAmt = SPREAD * mix(1.0, clamp(dist * 2.2, 0.0, 1.6), RADIAL);
+  vec2 axis = vec2(cos(ANGLE), sin(ANGLE));
+  vec2 perp = vec2(-axis.y, axis.x);
+  float along = (hash(uv * u_res + vec2(seed, 0.0)) - 0.5) * 2.0;
+  float across = (hash(uv * u_res + vec2(0.0, seed + 17.0)) - 0.5) * 2.0 * 0.2;
+  vec2 suv = uv + (axis * along + perp * across) * spreadAmt * texel;
+
+  // radial chromatic aberration around the point
+  vec2 d = suv - u_center;
+  vec2 uvR = u_center + d * (1.0 - ABERRATION);
+  vec2 uvB = u_center + d * (1.0 + ABERRATION);
+
+  // desaturate before recombining so fringes stay colored on the b&w base
+  vec3 sR = blurSample(uvR);
+  vec3 sG = blurSample(suv);
+  vec3 sB = blurSample(uvB);
+  const vec3 W = vec3(0.299, 0.587, 0.114);
+  vec3 col = mix(
+    vec3(sR.r, sG.g, sB.b),
+    vec3(dot(sR, W), dot(sG, W), dot(sB, W)),
+    BW
+  );
+
+  col = (col - 0.5) * CONTRAST + 0.5;
+  col = col * (1.0 - LIFT) + LIFT;
+
+  vec2 gcell = floor(uv * u_res / GRAINSIZE);
+  col += (hash(gcell + vec2(seed * 3.7, seed * 9.1)) - 0.5) * GRAIN;
+
+  gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+}`;
+
+const canvas = document.getElementById('canvas');
+const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true });
+const drop = document.getElementById('drop');
+const marker = document.getElementById('marker');
+const fileInput = document.getElementById('file');
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+const aPos = gl.getAttribLocation(prog, 'a_pos');
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+const U = {};
+['u_res','u_center','u_seed','u_bypass','u_loading','u_time','u_ampscale']
+  .forEach(n => U[n] = gl.getUniformLocation(prog, n));
+
+const texture = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, texture);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+const state = {
+  center: [0.5, 0.42],
+  pointSet: false,
+  seed: 1.0,
+  bypass: false,
+  hasImage: false,
+  originalSrc: null,   // data URL of the uploaded image
+  cutoutSrc: null,     // cached bg-removed version (light background)
+  loading: false,
+  time: 0,
+  ampScale: 1,
+  stopAt: null,
+};
+
+function render() {
+  if (!state.hasImage) return;
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.uniform2f(U.u_res, canvas.width, canvas.height);
+  gl.uniform2f(U.u_center, state.center[0], state.center[1]);
+  gl.uniform1f(U.u_seed, state.seed);
+  gl.uniform1f(U.u_bypass, state.bypass ? 1 : 0);
+  gl.uniform1f(U.u_loading, state.loading ? 1 : 0);
+  gl.uniform1f(U.u_time, state.time);
+  gl.uniform1f(U.u_ampscale, state.ampScale);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+function loadImage(src) {
+  const img = new Image();
+  img.onload = () => {
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    state.hasImage = true;
+    document.body.classList.add('loaded');
+    drop.classList.add('hidden');
+    canvas.classList.remove('hidden');
+    marker.style.display = state.pointSet ? 'block' : 'none';
+    render();
+    positionUi();
+  };
+  img.src = src;
+}
+
+function handleFile(file) {
+  if (!file || !file.type.startsWith('image/')) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    state.originalSrc = e.target.result;
+    state.cutoutSrc = null;
+    state.pointSet = false;
+    bgCheckbox.checked = false;
+    loadImage(state.originalSrc);
+  };
+  reader.readAsDataURL(file);
+}
+
+// --- background removal (in-browser model, @imgly/background-removal)
+const bgToggle = document.getElementById('bgToggle');
+const bgLabel = bgToggle.querySelector('span');
+const bgCheckbox = document.getElementById('removebg');
+
+// MODNet portrait matting in a worker (transformers.js) — WebGPU when
+// available, WASM fallback (phones). Returns an alpha mask at image size.
+const WORKER_SRC = `
+  import { AutoModel, AutoProcessor, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3/+esm';
+
+  let modelPromise = null;
+  function getModel() {
+    if (!modelPromise) {
+      modelPromise = (async () => {
+        const load = device => Promise.all([
+          AutoModel.from_pretrained('Xenova/modnet', { device }),
+          AutoProcessor.from_pretrained('Xenova/modnet'),
+        ]);
+        if (self.navigator && self.navigator.gpu) {
+          try { return await load('webgpu'); } catch (e) { /* fall through */ }
+        }
+        return await load('wasm');
+      })();
+    }
+    return modelPromise;
+  }
+
+  self.onmessage = async e => {
+    try {
+      const [model, processor] = await getModel();
+      const image = await RawImage.fromURL(e.data);
+      const { pixel_values } = await processor(image);
+      const { output } = await model({ input: pixel_values });
+      const mask = await RawImage.fromTensor(output[0].mul(255).to('uint8'))
+        .resize(image.width, image.height);
+      self.postMessage(
+        { ok: true, mask: mask.data, width: image.width, height: image.height },
+        [mask.data.buffer]
+      );
+    } catch (err) {
+      self.postMessage({ ok: false, error: String(err && err.stack || err) });
+    }
+  };
+`;
+let bgWorker = null;
+function removeBackgroundInWorker(src) {
+  if (!bgWorker) {
+    const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' }));
+    bgWorker = new Worker(url, { type: 'module' });
+    URL.revokeObjectURL(url);
+  }
+  return new Promise((resolve, reject) => {
+    bgWorker.onmessage = e => e.data.ok ? resolve(e.data) : reject(new Error(e.data.error));
+    bgWorker.onerror = e => reject(new Error(e.message || 'worker failed'));
+    bgWorker.postMessage(src);
+  });
+}
+
+// glitch-sweep loading state on the canvas while the model runs
+let loadingRaf = null;
+const STOP_DUR = 700; // ms, scramble settle time
+function startLoadingFx() {
+  const t0 = performance.now();
+  state.loading = true;
+  state.ampScale = 1;
+  state.stopAt = null;
+  const tick = now => {
+    state.time = (now - t0) / 1000;
+    if (state.stopAt !== null) {
+      // ease the scramble amplitude down instead of cutting it
+      const p = Math.min(1, (now - state.stopAt) / STOP_DUR);
+      state.ampScale = Math.pow(1 - p, 3); // ease-out cubic decay
+      if (p >= 1) {
+        state.loading = false;
+        state.ampScale = 1;
+        render();
+        return;
+      }
+    }
+    render();
+    loadingRaf = requestAnimationFrame(tick);
+  };
+  loadingRaf = requestAnimationFrame(tick);
+}
+function stopLoadingFx() {
+  if (!state.loading) return;
+  state.stopAt = performance.now();
+}
+
+async function makeCutout() {
+  bgLabel.textContent = 'Removing background…';
+  const { mask, width, height } = await removeBackgroundInWorker(state.originalSrc);
+  const img = new Image();
+  img.src = state.originalSrc;
+  await img.decode();
+  // apply the matte as the alpha channel
+  const cut = document.createElement('canvas');
+  cut.width = width;
+  cut.height = height;
+  const cctx = cut.getContext('2d');
+  cctx.drawImage(img, 0, 0, width, height);
+  const id = cctx.getImageData(0, 0, width, height);
+  for (let i = 0; i < mask.length; i++) id.data[i * 4 + 3] = mask[i];
+  cctx.putImageData(id, 0, 0);
+  // composite onto the light background
+  const out = document.createElement('canvas');
+  out.width = width;
+  out.height = height;
+  const octx = out.getContext('2d');
+  octx.fillStyle = '#e2e2e2';
+  octx.fillRect(0, 0, width, height);
+  octx.drawImage(cut, 0, 0);
+  return out.toDataURL('image/png');
+}
+
+bgCheckbox.addEventListener('change', async () => {
+  if (!state.hasImage) { bgCheckbox.checked = false; return; }
+  if (bgCheckbox.checked && !state.cutoutSrc) {
+    const srcAtStart = state.originalSrc;
+    bgToggle.classList.add('busy');
+    startLoadingFx();
+    try {
+      const cutout = await makeCutout();
+      if (state.originalSrc !== srcAtStart) return; // restarted mid-run
+      state.cutoutSrc = cutout;
+    } catch (err) {
+      console.error(err);
+      bgCheckbox.checked = false;
+      bgLabel.textContent = 'Failed. Try again?';
+      bgToggle.classList.remove('busy');
+      stopLoadingFx();
+      return;
+    }
+    bgToggle.classList.remove('busy');
+    bgLabel.textContent = 'Remove background';
+    stopLoadingFx();
+  }
+  loadImage(bgCheckbox.checked ? state.cutoutSrc : state.originalSrc);
+});
+
+drop.addEventListener('click', () => fileInput.click());
+document.getElementById('restart').addEventListener('click', () => {
+  stopLoadingFx();
+  state.hasImage = false;
+  state.originalSrc = null;
+  state.cutoutSrc = null;
+  state.pointSet = false;
+  bgCheckbox.checked = false;
+  bgToggle.classList.remove('busy');
+  bgLabel.textContent = 'Remove background';
+  canvas.classList.add('hidden');
+  marker.style.display = 'none';
+  overlay.style.display = 'none';
+  drop.classList.remove('hidden');
+  document.body.classList.remove('loaded');
+  fileInput.value = '';
+});
+fileInput.addEventListener('change', () => handleFile(fileInput.files[0]));
+
+document.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+document.addEventListener('dragleave', () => drop.classList.remove('over'));
+document.addEventListener('drop', e => {
+  e.preventDefault();
+  drop.classList.remove('over');
+  handleFile(e.dataTransfer.files[0]);
+});
+document.addEventListener('paste', e => {
+  const item = [...e.clipboardData.items].find(i => i.type.startsWith('image/'));
+  if (item) handleFile(item.getAsFile());
+});
+
+const overlay = document.getElementById('overlay');
+if (matchMedia('(hover: none) and (pointer: coarse)').matches) {
+  overlay.textContent = 'Tap to set the point';
+}
+function positionUi() {
+  if (!state.hasImage) return;
+  const r = canvas.getBoundingClientRect();
+  marker.style.left = (r.left + state.center[0] * r.width) + 'px';
+  marker.style.top = (r.top + state.center[1] * r.height) + 'px';
+  const stage = document.getElementById('stage').getBoundingClientRect();
+  overlay.style.left = (r.left - stage.left) + 'px';
+  overlay.style.top = (r.top - stage.top) + 'px';
+  overlay.style.width = r.width + 'px';
+  overlay.style.height = r.height + 'px';
+  overlay.style.display = state.pointSet ? 'none' : 'flex';
+}
+window.addEventListener('resize', positionUi);
+
+canvas.addEventListener('pointerdown', e => {
+  const r = canvas.getBoundingClientRect();
+  state.pointSet = true;
+  marker.style.display = 'block';
+  const move = ev => {
+    state.center = [
+      Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)),
+      Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height)),
+    ];
+    render();
+    positionUi();
+  };
+  move(e);
+  const up = () => {
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', up);
+  };
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key.toLowerCase() === 'b' && !e.repeat) { state.bypass = true; render(); }
+});
+document.addEventListener('keyup', e => {
+  if (e.key.toLowerCase() === 'b') { state.bypass = false; render(); }
+});
+
+document.getElementById('save').addEventListener('click', () => {
+  if (!state.hasImage) return;
+  render();
+  canvas.toBlob(blob => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'foto-export.png';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }, 'image/png');
+});
+</script>
+</body>
+</html>
