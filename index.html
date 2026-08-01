@@ -28,6 +28,7 @@
     max-width: calc(100% - 48px);
     max-height: calc(100% - 48px);
     cursor: crosshair;
+    touch-action: none;
     border: 1px solid #e0e0e0;
   }
   #drop {
@@ -44,21 +45,48 @@
   }
   #drop:hover, #drop.over { color: #000; }
   #drop.hidden, #canvas.hidden { display: none; }
-  #marker {
+  #effectControl {
     position: absolute;
-    width: 14px; height: 14px;
-    pointer-events: none;
     display: none;
-    transform: translate(-50%, -50%);
-  }
-  #marker::before, #marker::after {
-    content: '';
-    position: absolute;
-    background: rgba(255,255,255,.85);
+    overflow: hidden;
+    pointer-events: none;
+    touch-action: none;
+    user-select: none;
     mix-blend-mode: difference;
   }
-  #marker::before { left: 6px; top: 0; width: 2px; height: 14px; }
-  #marker::after { left: 0; top: 6px; width: 14px; height: 2px; }
+  #effectControl .control-visual {
+    fill: none;
+    stroke: #fff;
+    vector-effect: non-scaling-stroke;
+  }
+  #effectRing {
+    stroke-width: 1;
+    stroke-dasharray: 4 5;
+    opacity: .8;
+  }
+  #directionLine { stroke-width: 1; opacity: .9; }
+  #moveHit {
+    fill: rgba(0,0,0,.001);
+    stroke: none;
+    pointer-events: all;
+    cursor: move;
+  }
+  .control-handle {
+    pointer-events: all;
+    cursor: grab;
+    outline: none;
+  }
+  .control-handle:active { cursor: grabbing; }
+  .control-hit { fill: rgba(0,0,0,.001); stroke: none; }
+  .control-dot { fill: #fff; stroke: none; }
+  #centerHandle .control-dot { r: 5; }
+  #directionHandle .control-dot { r: 5; }
+  #radiusHandle { cursor: nwse-resize; }
+  #radiusGrip { fill: none; stroke: #fff; stroke-width: 1.5; }
+  #centerCross { stroke-width: 1; }
+  .control-handle:focus .control-dot,
+  .control-handle:focus #radiusGrip { stroke: #fff; stroke-width: 2; }
+  .control-handle:focus .control-hit { stroke: #fff; stroke-width: 1; }
   #overlay {
     position: absolute;
     display: none;
@@ -127,12 +155,29 @@
     <div>Or click to choose a file</div>
   </div>
   <canvas id="canvas" class="hidden"></canvas>
-  <div id="marker"></div>
-  <div id="overlay">Click to set the point</div>
+  <svg id="effectControl" aria-label="Displacement controls">
+    <circle id="moveHit"></circle>
+    <circle id="effectRing" class="control-visual"></circle>
+    <line id="directionLine" class="control-visual"></line>
+    <g id="centerHandle" class="control-handle" role="slider" tabindex="0" aria-label="Effect position">
+      <circle class="control-hit" r="22"></circle>
+      <circle class="control-dot" r="5"></circle>
+      <path id="centerCross" class="control-visual" d="M-10 0H10M0-10V10"></path>
+    </g>
+    <g id="directionHandle" class="control-handle" role="slider" tabindex="0" aria-label="Displacement direction">
+      <circle class="control-hit" r="22"></circle>
+      <circle class="control-dot" r="5"></circle>
+    </g>
+    <g id="radiusHandle" class="control-handle" role="slider" tabindex="0" aria-label="Effect size">
+      <circle class="control-hit" r="22"></circle>
+      <rect id="radiusGrip" x="-5" y="-5" width="10" height="10" transform="rotate(45)"></rect>
+    </g>
+  </svg>
+  <div id="overlay">Click to place the effect</div>
 </div>
 
 <div id="bar">
-  <div class="hint">Hold B to compare.</div>
+  <div class="hint">Drag the circle, dot, and corner to adjust. Hold B to compare.</div>
   <label class="toggle" id="bgToggle">
     <input type="checkbox" id="removebg">
     <span>Remove background</span>
@@ -171,6 +216,8 @@ varying vec2 v_uv;
 uniform sampler2D u_image;
 uniform vec2 u_res;
 uniform vec2 u_center;
+uniform vec2 u_direction;
+uniform float u_radius;
 uniform float u_seed;
 uniform float u_bypass;
 uniform float u_loading;   // 1 while the bg-removal model runs
@@ -184,7 +231,6 @@ const float BLUR = ${P.blur.toFixed(4)};
 const float ABERRATION = ${P.aberration.toFixed(4)};
 const float SPREAD = ${P.spread.toFixed(4)};
 const float RADIAL = ${P.radial.toFixed(4)};
-const float ANGLE = ${P.angle.toFixed(4)};
 const float GRAIN = ${P.grain.toFixed(4)};
 const float GRAINSIZE = ${P.grainsize.toFixed(4)};
 
@@ -194,10 +240,11 @@ float hash(vec2 p) {
   return fract((p3.x + p3.y) * p3.z);
 }
 
-// motion blur: gaussian-weighted line blur along the tear direction
-vec3 blurSample(vec2 uv) {
-  if (BLUR < 0.01) return texture2D(u_image, uv).rgb;
-  vec2 dir = vec2(cos(ANGLE), sin(ANGLE)) * BLUR / u_res;
+// motion blur: gaussian-weighted line blur along the selected direction
+vec3 blurSample(vec2 uv, float amount) {
+  float blurAmount = BLUR * amount;
+  if (blurAmount < 0.01) return texture2D(u_image, uv).rgb;
+  vec2 dir = u_direction * blurAmount / u_res;
   vec3 c = vec3(0.0);
   float wsum = 0.0;
   for (int i = -4; i <= 4; i++) {
@@ -232,26 +279,31 @@ void main() {
   }
 
   vec2 texel = 1.0 / u_res;
-  vec2 fromCenter = uv - u_center;
-  float dist = length(fromCenter);
+  vec2 fromCenterPx = (uv - u_center) * u_res;
+  float radiusPx = max(1.0, u_radius * min(u_res.x, u_res.y));
+  float range = length(fromCenterPx) / radiusPx;
 
-  // pixel spread: directional tear, amount grows with distance from point
-  float spreadAmt = SPREAD * mix(1.0, clamp(dist * 2.2, 0.0, 1.6), RADIAL);
-  vec2 axis = vec2(cos(ANGLE), sin(ANGLE));
+  // The tear grows away from the point, then eases cleanly to zero at the ring.
+  float radialRise = mix(1.0, smoothstep(0.0, 0.38, range), RADIAL);
+  float rangeFalloff = 1.0 - smoothstep(0.68, 1.0, range);
+  float effectAmount = radialRise * rangeFalloff;
+  float spreadAmt = SPREAD * effectAmount;
+  vec2 axis = normalize(u_direction);
   vec2 perp = vec2(-axis.y, axis.x);
   float along = (hash(uv * u_res + vec2(seed, 0.0)) - 0.5) * 2.0;
   float across = (hash(uv * u_res + vec2(0.0, seed + 17.0)) - 0.5) * 2.0 * 0.2;
   vec2 suv = uv + (axis * along + perp * across) * spreadAmt * texel;
 
-  // radial chromatic aberration around the point
+  // Local chromatic aberration and blur use the same circular falloff.
   vec2 d = suv - u_center;
-  vec2 uvR = u_center + d * (1.0 - ABERRATION);
-  vec2 uvB = u_center + d * (1.0 + ABERRATION);
+  float aberration = ABERRATION * effectAmount;
+  vec2 uvR = u_center + d * (1.0 - aberration);
+  vec2 uvB = u_center + d * (1.0 + aberration);
 
   // desaturate before recombining so fringes stay colored on the b&w base
-  vec3 sR = blurSample(uvR);
-  vec3 sG = blurSample(suv);
-  vec3 sB = blurSample(uvB);
+  vec3 sR = blurSample(uvR, effectAmount);
+  vec3 sG = blurSample(suv, effectAmount);
+  vec3 sB = blurSample(uvB, effectAmount);
   const vec3 W = vec3(0.299, 0.587, 0.114);
   vec3 col = mix(
     vec3(sR.r, sG.g, sB.b),
@@ -271,7 +323,13 @@ void main() {
 const canvas = document.getElementById('canvas');
 const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true });
 const drop = document.getElementById('drop');
-const marker = document.getElementById('marker');
+const effectControl = document.getElementById('effectControl');
+const moveHit = document.getElementById('moveHit');
+const effectRing = document.getElementById('effectRing');
+const directionLine = document.getElementById('directionLine');
+const centerHandle = document.getElementById('centerHandle');
+const directionHandle = document.getElementById('directionHandle');
+const radiusHandle = document.getElementById('radiusHandle');
 const fileInput = document.getElementById('file');
 const MAX_IMAGE_DIMENSION = 1080;
 
@@ -297,7 +355,7 @@ gl.enableVertexAttribArray(aPos);
 gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
 const U = {};
-['u_res','u_center','u_seed','u_bypass','u_loading','u_time','u_ampscale']
+['u_res','u_center','u_direction','u_radius','u_seed','u_bypass','u_loading','u_time','u_ampscale']
   .forEach(n => U[n] = gl.getUniformLocation(prog, n));
 
 const texture = gl.createTexture();
@@ -307,8 +365,17 @@ gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
+const DEFAULT_CENTER = [0.5, 0.42];
+const DEFAULT_DIRECTION = [Math.cos(P.angle), Math.sin(P.angle)];
+const DEFAULT_RADIUS = 0.32;
+const MIN_RADIUS = 0.14;
+const MAX_RADIUS = 0.6;
+const CONTROL_INSET = 24;
+
 const state = {
-  center: [0.5, 0.42],
+  center: [...DEFAULT_CENTER],
+  direction: [...DEFAULT_DIRECTION],
+  radius: DEFAULT_RADIUS,
   pointSet: false,
   seed: 1.0,
   bypass: false,
@@ -321,12 +388,15 @@ const state = {
   ampScale: 1,
   stopAt: null,
 };
+let imageLoadGeneration = 0;
 
 function render() {
   if (!state.hasImage) return;
   gl.viewport(0, 0, canvas.width, canvas.height);
   gl.uniform2f(U.u_res, canvas.width, canvas.height);
   gl.uniform2f(U.u_center, state.center[0], state.center[1]);
+  gl.uniform2f(U.u_direction, state.direction[0], state.direction[1]);
+  gl.uniform1f(U.u_radius, state.radius);
   gl.uniform1f(U.u_seed, state.seed);
   gl.uniform1f(U.u_bypass, state.bypass ? 1 : 0);
   gl.uniform1f(U.u_loading, state.loading ? 1 : 0);
@@ -372,7 +442,7 @@ function loadImage(src) {
     document.body.classList.add('loaded');
     drop.classList.add('hidden');
     canvas.classList.remove('hidden');
-    marker.style.display = state.pointSet ? 'block' : 'none';
+    effectControl.style.display = state.pointSet ? 'block' : 'none';
     render();
     positionUi();
   };
@@ -381,18 +451,31 @@ function loadImage(src) {
 
 function handleFile(file) {
   if (!file || !file.type.startsWith('image/')) return;
+  const generation = ++imageLoadGeneration;
   const reader = new FileReader();
   reader.onload = async e => {
     try {
-      state.originalSrc = await resizeImageForProcessing(e.target.result);
+      const resizedSrc = await resizeImageForProcessing(e.target.result);
+      if (generation !== imageLoadGeneration) return;
+      cancelControlDrag();
+      stopLoadingFx();
+      state.originalSrc = resizedSrc;
       state.cutoutSrc = null;
       state.backgroundModel = null;
+      state.center = [...DEFAULT_CENTER];
+      state.direction = [...DEFAULT_DIRECTION];
+      state.radius = DEFAULT_RADIUS;
       state.pointSet = false;
       bgCheckbox.checked = false;
+      bgToggle.classList.remove('busy');
+      bgLabel.textContent = 'Remove background';
       loadImage(state.originalSrc);
     } catch (err) {
-      console.error(err);
+      if (generation === imageLoadGeneration) console.error(err);
     }
+  };
+  reader.onerror = () => {
+    if (generation === imageLoadGeneration) console.error(new Error('Could not read image'));
   };
   reader.readAsDataURL(file);
 }
@@ -675,17 +758,22 @@ bgCheckbox.addEventListener('change', async () => {
 
 drop.addEventListener('click', () => fileInput.click());
 document.getElementById('restart').addEventListener('click', () => {
+  imageLoadGeneration++;
+  cancelControlDrag();
   stopLoadingFx();
   state.hasImage = false;
   state.originalSrc = null;
   state.cutoutSrc = null;
   state.backgroundModel = null;
+  state.center = [...DEFAULT_CENTER];
+  state.direction = [...DEFAULT_DIRECTION];
+  state.radius = DEFAULT_RADIUS;
   state.pointSet = false;
   bgCheckbox.checked = false;
   bgToggle.classList.remove('busy');
   bgLabel.textContent = 'Remove background';
   canvas.classList.add('hidden');
-  marker.style.display = 'none';
+  effectControl.style.display = 'none';
   overlay.style.display = 'none';
   drop.classList.remove('hidden');
   document.body.classList.remove('loaded');
@@ -707,41 +795,248 @@ document.addEventListener('paste', e => {
 
 const overlay = document.getElementById('overlay');
 if (matchMedia('(hover: none) and (pointer: coarse)').matches) {
-  overlay.textContent = 'Tap to set the point';
+  overlay.textContent = 'Tap to place the effect';
 }
+function controlBounds(width, height) {
+  const insetX = Math.min(CONTROL_INSET, width * 0.06);
+  const insetY = Math.min(CONTROL_INSET, height * 0.06);
+  return { insetX, insetY };
+}
+
+function constrainCenter(center, width, height) {
+  const { insetX, insetY } = controlBounds(width, height);
+  return [
+    Math.min(1 - insetX / width, Math.max(insetX / width, center[0])),
+    Math.min(1 - insetY / height, Math.max(insetY / height, center[1])),
+  ];
+}
+
 function positionUi() {
   if (!state.hasImage) return;
   const r = canvas.getBoundingClientRect();
-  marker.style.left = (r.left + state.center[0] * r.width) + 'px';
-  marker.style.top = (r.top + state.center[1] * r.height) + 'px';
   const stage = document.getElementById('stage').getBoundingClientRect();
-  overlay.style.left = (r.left - stage.left) + 'px';
-  overlay.style.top = (r.top - stage.top) + 'px';
-  overlay.style.width = r.width + 'px';
-  overlay.style.height = r.height + 'px';
+  const left = r.left - stage.left;
+  const top = r.top - stage.top;
+  const width = r.width;
+  const height = r.height;
+  const constrainedCenter = constrainCenter(state.center, width, height);
+  if (constrainedCenter[0] !== state.center[0] || constrainedCenter[1] !== state.center[1]) {
+    state.center = constrainedCenter;
+    render();
+  }
+  const { insetX, insetY } = controlBounds(width, height);
+  const shortestSide = Math.min(width, height);
+  const cx = state.center[0] * width;
+  const cy = state.center[1] * height;
+  const radius = state.radius * shortestSide;
+
+  const raySpace = (dx, dy) => {
+    let space = Infinity;
+    if (Math.abs(dx) > 0.0001) {
+      const edgeX = dx > 0 ? width - insetX : insetX;
+      space = Math.min(space, (edgeX - cx) / dx);
+    }
+    if (Math.abs(dy) > 0.0001) {
+      const edgeY = dy > 0 ? height - insetY : insetY;
+      space = Math.min(space, (edgeY - cy) / dy);
+    }
+    return Math.max(0, space);
+  };
+
+  let visualDirection = state.direction;
+  if (!activeControlDrag || activeControlDrag.mode !== 'direction') {
+    const forwardSpace = raySpace(state.direction[0], state.direction[1]);
+    const backwardSpace = raySpace(-state.direction[0], -state.direction[1]);
+    if (backwardSpace > forwardSpace) {
+      visualDirection = [-state.direction[0], -state.direction[1]];
+    }
+  }
+  const directionLength = Math.min(
+    radius * 0.62,
+    raySpace(visualDirection[0], visualDirection[1])
+  );
+  const directionX = cx + visualDirection[0] * directionLength;
+  const directionY = cy + visualDirection[1] * directionLength;
+
+  // Keep the resize grip on the ring, toward the farthest available corner.
+  const targetX = cx < width * 0.5 ? width - insetX : insetX;
+  const targetY = cy < height * 0.5 ? height - insetY : insetY;
+  const radiusDx = targetX - cx;
+  const radiusDy = targetY - cy;
+  const radiusTargetDistance = Math.max(1, Math.hypot(radiusDx, radiusDy));
+  const radiusHandleDistance = Math.min(radius, radiusTargetDistance);
+  const radiusX = cx + radiusDx / radiusTargetDistance * radiusHandleDistance;
+  const radiusY = cy + radiusDy / radiusTargetDistance * radiusHandleDistance;
+
+  overlay.style.left = left + 'px';
+  overlay.style.top = top + 'px';
+  overlay.style.width = width + 'px';
+  overlay.style.height = height + 'px';
   overlay.style.display = state.pointSet ? 'none' : 'flex';
+
+  effectControl.style.left = left + 'px';
+  effectControl.style.top = top + 'px';
+  effectControl.style.width = width + 'px';
+  effectControl.style.height = height + 'px';
+  effectControl.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  effectControl.style.display = state.pointSet ? 'block' : 'none';
+
+  moveHit.setAttribute('cx', cx);
+  moveHit.setAttribute('cy', cy);
+  moveHit.setAttribute('r', radius);
+  effectRing.setAttribute('cx', cx);
+  effectRing.setAttribute('cy', cy);
+  effectRing.setAttribute('r', radius);
+  directionLine.setAttribute('x1', cx);
+  directionLine.setAttribute('y1', cy);
+  directionLine.setAttribute('x2', directionX);
+  directionLine.setAttribute('y2', directionY);
+  centerHandle.setAttribute('transform', `translate(${cx} ${cy})`);
+  directionHandle.setAttribute('transform', `translate(${directionX} ${directionY})`);
+  radiusHandle.setAttribute('transform', `translate(${radiusX} ${radiusY})`);
+
+  centerHandle.setAttribute('aria-valuenow', Math.round(state.center[0] * 100));
+  centerHandle.setAttribute('aria-valuemin', '0');
+  centerHandle.setAttribute('aria-valuemax', '100');
+  centerHandle.setAttribute(
+    'aria-valuetext',
+    `${Math.round(state.center[0] * 100)}%, ${Math.round(state.center[1] * 100)}%`
+  );
+  const angle = (Math.atan2(visualDirection[1], visualDirection[0]) * 180 / Math.PI + 360) % 360;
+  directionHandle.setAttribute('aria-valuenow', Math.round(angle));
+  directionHandle.setAttribute('aria-valuemin', '0');
+  directionHandle.setAttribute('aria-valuemax', '359');
+  radiusHandle.setAttribute('aria-valuenow', Math.round(state.radius * 100));
+  radiusHandle.setAttribute('aria-valuemin', Math.round(MIN_RADIUS * 100));
+  radiusHandle.setAttribute('aria-valuemax', Math.round(MAX_RADIUS * 100));
 }
 window.addEventListener('resize', positionUi);
 
-canvas.addEventListener('pointerdown', e => {
+function pointerInCanvas(e) {
   const r = canvas.getBoundingClientRect();
+  return {
+    r,
+    x: e.clientX - r.left,
+    y: e.clientY - r.top,
+  };
+}
+
+let activeControlDrag = null;
+function beginControlDrag(mode, e, preserveOffset = false) {
+  e.preventDefault();
+  e.stopPropagation();
+  if (activeControlDrag) return;
+  const p = pointerInCanvas(e);
+  activeControlDrag = {
+    mode,
+    pointerId: e.pointerId,
+    captureTarget: e.currentTarget,
+    offset: preserveOffset
+      ? [state.center[0] - p.x / p.r.width, state.center[1] - p.y / p.r.height]
+      : [0, 0],
+  };
+  try { e.currentTarget.setPointerCapture(e.pointerId); } catch (_) {}
+  if (mode === 'center') updateControlDrag(e);
+  window.addEventListener('pointermove', updateControlDrag, { passive: false });
+  window.addEventListener('pointerup', endControlDrag);
+  window.addEventListener('pointercancel', endControlDrag);
+}
+
+function updateControlDrag(e) {
+  if (!activeControlDrag || e.pointerId !== activeControlDrag.pointerId) return;
+  if (e.cancelable) e.preventDefault();
+  const p = pointerInCanvas(e);
+  if (activeControlDrag.mode === 'center') {
+    state.center = constrainCenter(
+      [
+        p.x / p.r.width + activeControlDrag.offset[0],
+        p.y / p.r.height + activeControlDrag.offset[1],
+      ],
+      p.r.width,
+      p.r.height
+    );
+  } else if (activeControlDrag.mode === 'direction') {
+    const dx = p.x - state.center[0] * p.r.width;
+    const dy = p.y - state.center[1] * p.r.height;
+    const length = Math.hypot(dx, dy);
+    if (length > 2) state.direction = [dx / length, dy / length];
+  } else if (activeControlDrag.mode === 'radius') {
+    const dx = p.x - state.center[0] * p.r.width;
+    const dy = p.y - state.center[1] * p.r.height;
+    state.radius = Math.min(
+      MAX_RADIUS,
+      Math.max(MIN_RADIUS, Math.hypot(dx, dy) / Math.min(p.r.width, p.r.height))
+    );
+  }
+  render();
+  positionUi();
+}
+
+function cancelControlDrag() {
+  if (activeControlDrag) {
+    const { captureTarget, pointerId } = activeControlDrag;
+    try {
+      if (captureTarget?.hasPointerCapture(pointerId)) captureTarget.releasePointerCapture(pointerId);
+    } catch (_) {}
+  }
+  activeControlDrag = null;
+  window.removeEventListener('pointermove', updateControlDrag);
+  window.removeEventListener('pointerup', endControlDrag);
+  window.removeEventListener('pointercancel', endControlDrag);
+}
+
+function endControlDrag(e) {
+  if (!activeControlDrag || e.pointerId !== activeControlDrag.pointerId) return;
+  cancelControlDrag();
+}
+window.addEventListener('blur', cancelControlDrag);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) cancelControlDrag();
+});
+
+moveHit.addEventListener('pointerdown', e => beginControlDrag('center', e, true));
+centerHandle.addEventListener('pointerdown', e => beginControlDrag('center', e, true));
+directionHandle.addEventListener('pointerdown', e => beginControlDrag('direction', e));
+radiusHandle.addEventListener('pointerdown', e => beginControlDrag('radius', e));
+
+canvas.addEventListener('pointerdown', e => {
   state.pointSet = true;
-  marker.style.display = 'block';
-  const move = ev => {
-    state.center = [
-      Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)),
-      Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height)),
-    ];
-    render();
-    positionUi();
-  };
-  move(e);
-  const up = () => {
-    window.removeEventListener('pointermove', move);
-    window.removeEventListener('pointerup', up);
-  };
-  window.addEventListener('pointermove', move);
-  window.addEventListener('pointerup', up);
+  beginControlDrag('center', e);
+});
+
+centerHandle.addEventListener('keydown', e => {
+  if (!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key)) return;
+  e.preventDefault();
+  const step = e.shiftKey ? 0.05 : 0.01;
+  if (e.key === 'ArrowLeft') state.center[0] -= step;
+  if (e.key === 'ArrowRight') state.center[0] += step;
+  if (e.key === 'ArrowUp') state.center[1] -= step;
+  if (e.key === 'ArrowDown') state.center[1] += step;
+  const r = canvas.getBoundingClientRect();
+  state.center = constrainCenter(state.center, r.width, r.height);
+  render();
+  positionUi();
+});
+
+directionHandle.addEventListener('keydown', e => {
+  if (!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key)) return;
+  e.preventDefault();
+  const current = Math.atan2(state.direction[1], state.direction[0]);
+  const step = (e.shiftKey ? 15 : 5) * Math.PI / 180;
+  const next = current + (e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -step : step);
+  state.direction = [Math.cos(next), Math.sin(next)];
+  render();
+  positionUi();
+});
+
+radiusHandle.addEventListener('keydown', e => {
+  if (!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key)) return;
+  e.preventDefault();
+  const step = e.shiftKey ? 0.05 : 0.01;
+  const grow = e.key === 'ArrowRight' || e.key === 'ArrowUp';
+  state.radius = Math.min(MAX_RADIUS, Math.max(MIN_RADIUS, state.radius + (grow ? step : -step)));
+  render();
+  positionUi();
 });
 
 document.addEventListener('keydown', e => {
