@@ -973,16 +973,17 @@ function updateControlDrag(e) {
 }
 
 function cancelControlDrag() {
-  if (activeControlDrag) {
-    const { captureTarget, pointerId } = activeControlDrag;
-    try {
-      if (captureTarget?.hasPointerCapture(pointerId)) captureTarget.releasePointerCapture(pointerId);
-    } catch (_) {}
-  }
+  const drag = activeControlDrag;
   activeControlDrag = null;
   window.removeEventListener('pointermove', updateControlDrag);
   window.removeEventListener('pointerup', endControlDrag);
   window.removeEventListener('pointercancel', endControlDrag);
+  if (drag) {
+    const { captureTarget, pointerId } = drag;
+    try {
+      if (captureTarget?.hasPointerCapture(pointerId)) captureTarget.releasePointerCapture(pointerId);
+    } catch (_) {}
+  }
 }
 
 function endControlDrag(e) {
@@ -998,6 +999,11 @@ moveHit.addEventListener('pointerdown', e => beginControlDrag('center', e, true)
 centerHandle.addEventListener('pointerdown', e => beginControlDrag('center', e, true));
 directionHandle.addEventListener('pointerdown', e => beginControlDrag('direction', e));
 radiusHandle.addEventListener('pointerdown', e => beginControlDrag('radius', e));
+[canvas, moveHit, centerHandle, directionHandle, radiusHandle].forEach(element => {
+  element.addEventListener('lostpointercapture', e => {
+    if (activeControlDrag?.pointerId === e.pointerId) cancelControlDrag();
+  });
+});
 
 canvas.addEventListener('pointerdown', e => {
   state.pointSet = true;
