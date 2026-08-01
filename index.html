@@ -196,7 +196,8 @@ const P = {
   blur: 1.8,
   aberration: 0.012,
   spread: 6.0,
-  radial: 1.0,     // the control circle protects its interior from displacement
+  edgeSpread: 2.0, // displacement strength exactly at the circle edge
+  radial: 1.0,     // 0 → edgeSpread inside, edgeSpread → spread outside
   angle: 0.0,      // horizontal tear
   grain: 0.09,
   grainsize: 1.0,
@@ -230,6 +231,7 @@ const float LIFT = ${P.lift.toFixed(4)};
 const float BLUR = ${P.blur.toFixed(4)};
 const float ABERRATION = ${P.aberration.toFixed(4)};
 const float SPREAD = ${P.spread.toFixed(4)};
+const float EDGE_SPREAD = ${P.edgeSpread.toFixed(4)};
 const float RADIAL = ${P.radial.toFixed(4)};
 const float ANGLE = ${P.angle.toFixed(4)};
 const float GRAIN = ${P.grain.toFixed(4)};
@@ -283,11 +285,17 @@ void main() {
   float radiusPx = max(1.0, u_radius * min(u_res.x, u_res.y));
   float range = length(fromCenterPx) / radiusPx;
 
-  // The whole circle is a protected zone. Displacement starts at zero just
-  // outside its edge, then ramps to full strength over 45% of the radius.
+  // Inside: rise smoothly from 0 at the center to EDGE_SPREAD at the ring.
+  // Outside: continue from EDGE_SPREAD to full SPREAD over 45% of the radius.
   float outsideRange = max(range - 1.0, 0.0);
-  float displacementAmount = mix(1.0, smoothstep(0.0, 0.45, outsideRange), RADIAL);
-  float spreadAmt = SPREAD * displacementAmount;
+  float insideSpread = EDGE_SPREAD * smoothstep(0.0, 1.0, range);
+  float outsideSpread = mix(
+    EDGE_SPREAD,
+    SPREAD,
+    smoothstep(0.0, 0.45, outsideRange)
+  );
+  float radialSpread = mix(insideSpread, outsideSpread, step(1.0, range));
+  float spreadAmt = mix(SPREAD, radialSpread, RADIAL);
   vec2 axis = normalize(u_direction);
   vec2 perp = vec2(-axis.y, axis.x);
   float along = (hash(uv * u_res + vec2(seed, 0.0)) - 0.5) * 2.0;
