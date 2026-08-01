@@ -391,44 +391,89 @@ function handleFile(file) {
   reader.readAsDataURL(file);
 }
 
-// --- background removal (in-browser model, @imgly/background-removal)
+// --- background removal (local in-browser models, transformers.js)
 const bgToggle = document.getElementById('bgToggle');
 const bgLabel = bgToggle.querySelector('span');
 const bgCheckbox = document.getElementById('removebg');
 
-// MODNet portrait matting in a worker (transformers.js) — WebGPU when
-// available, WASM fallback (phones). Returns an alpha mask at image size.
+// ORMBG fp16 on WebGPU, with quantized MODNet on WASM as the compatibility
+// fallback. Both run in a worker and return an alpha mask at image size.
 const WORKER_SRC = `
-  import { AutoModel, AutoProcessor, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3/+esm';
+  import { pipeline, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm';
 
-  let modelPromise = null;
-  function getModel() {
-    if (!modelPromise) {
-      modelPromise = (async () => {
-        const load = device => Promise.all([
-          AutoModel.from_pretrained('Xenova/modnet', { device }),
-          AutoProcessor.from_pretrained('Xenova/modnet'),
-        ]);
+  const ORMBG = {
+    name: 'ormbg',
+    id: 'onnx-community/ormbg-ONNX',
+    options: {
+      device: 'webgpu',
+      dtype: 'fp16',
+      revision: '034e2d884afbab897e10e78fc5bb566b29533fd6',
+    },
+  };
+  const MODNET = {
+    name: 'modnet',
+    id: 'Xenova/modnet',
+    options: {
+      device: 'wasm',
+      dtype: 'q8',
+      revision: 'fa2fa546052fba4c08921230a26cc69a333fca12',
+    },
+  };
+
+  let runnerPromise = null;
+
+  async function loadRunner(config) {
+    const segmenter = await pipeline('background-removal', config.id, config.options);
+    return { segmenter, name: config.name };
+  }
+
+  function getRunner() {
+    if (!runnerPromise) {
+      runnerPromise = (async () => {
         if (self.navigator && self.navigator.gpu) {
-          try { return await load('webgpu'); } catch (e) { /* fall through */ }
+          try { return await loadRunner(ORMBG); } catch (e) { /* fall through */ }
         }
-        return await load('wasm');
+        return loadRunner(MODNET);
       })();
     }
-    return modelPromise;
+    return runnerPromise;
+  }
+
+  async function removeBackground(image) {
+    let runner = await getRunner();
+    try {
+      return { output: await runner.segmenter(image), model: runner.name };
+    } catch (err) {
+      if (runner.name !== ORMBG.name) throw err;
+      try { await runner.segmenter.dispose(); } catch (e) { /* best effort */ }
+      runnerPromise = loadRunner(MODNET);
+      runner = await runnerPromise;
+      return { output: await runner.segmenter(image), model: runner.name };
+    }
   }
 
   self.onmessage = async e => {
     try {
-      const [model, processor] = await getModel();
       const image = await RawImage.fromURL(e.data);
-      const { pixel_values } = await processor(image);
-      const { output } = await model({ input: pixel_values });
-      const mask = await RawImage.fromTensor(output[0].mul(255).to('uint8'))
-        .resize(image.width, image.height);
+      const { output, model } = await removeBackground(image);
+      let cutout = output[0];
+      if (cutout.width !== image.width || cutout.height !== image.height) {
+        cutout = await cutout.resize(image.width, image.height);
+      }
+
+      let mask;
+      if (cutout.channels === 4) {
+        mask = new Uint8ClampedArray(image.width * image.height);
+        for (let i = 0; i < mask.length; i++) mask[i] = cutout.data[i * 4 + 3];
+      } else if (cutout.channels === 1) {
+        mask = cutout.data;
+      } else {
+        throw new Error('Unexpected background-removal output');
+      }
+
       self.postMessage(
-        { ok: true, mask: mask.data, width: image.width, height: image.height },
-        [mask.data.buffer]
+        { ok: true, mask, width: image.width, height: image.height, model },
+        [mask.buffer]
       );
     } catch (err) {
       self.postMessage({ ok: false, error: String(err && err.stack || err) });
