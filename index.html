@@ -288,7 +288,9 @@ void main() {
   float rangeFalloff = 1.0 - smoothstep(0.68, 1.0, range);
   float effectAmount = radialRise * rangeFalloff;
   float spreadAmt = SPREAD * effectAmount;
-  vec2 axis = normalize(u_direction);
+  // Texture lookup runs opposite to perceived pixel motion, so invert the
+  // sampling axis to make the visible displacement follow the control.
+  vec2 axis = -normalize(u_direction);
   vec2 perp = vec2(-axis.y, axis.x);
   float along = (hash(uv * u_res + vec2(seed, 0.0)) - 0.5) * 2.0;
   float across = (hash(uv * u_res + vec2(0.0, seed + 17.0)) - 0.5) * 2.0 * 0.2;
