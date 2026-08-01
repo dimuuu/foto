@@ -513,6 +513,129 @@ const bgToggle = document.getElementById('bgToggle');
 const bgLabel = bgToggle.querySelector('span');
 const bgCheckbox = document.getElementById('removebg');
 
+// Quality-first desktop attempt. This runs in a disposable WebGPU worker so
+// any failure releases its memory before the existing RVM → MODNet path runs.
+const BEN2_WORKER_SRC = `
+  const TRANSFORMERS_URL = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0';
+  const MODEL_ID = 'onnx-community/BEN2-ONNX';
+  const MODEL_REVISION = 'c552aa82688edce09f0ac9d2e31ad53d9d629010';
+  const MODEL_NAME = 'ben2-fp16-webgpu';
+
+  function report(level, message, details = {}) {
+    self.postMessage({ type: 'diagnostic', level, message, details });
+  }
+
+  self.onmessage = async e => {
+    const startedAt = performance.now();
+    try {
+      report('log', 'loading quality model', { model: MODEL_NAME });
+      const { pipeline } = await import(TRANSFORMERS_URL);
+      const segmenter = await pipeline('background-removal', MODEL_ID, {
+        revision: MODEL_REVISION,
+        device: 'webgpu',
+        dtype: 'fp16',
+      });
+      report('log', 'quality model ready', {
+        model: MODEL_NAME,
+        ms: Math.round(performance.now() - startedAt),
+      });
+
+      const output = await segmenter(e.data.src);
+      const image = output && output[0];
+      if (!image || image.channels !== 4) {
+        throw new Error('Unexpected BEN2 output');
+      }
+      if (image.width !== e.data.width || image.height !== e.data.height) {
+        throw new Error('Unexpected BEN2 dimensions');
+      }
+
+      const mask = new Uint8ClampedArray(image.width * image.height);
+      for (let i = 0; i < mask.length; i++) mask[i] = image.data[i * 4 + 3];
+      report('log', 'inference complete', {
+        model: MODEL_NAME,
+        width: image.width,
+        height: image.height,
+        ms: Math.round(performance.now() - startedAt),
+      });
+      self.postMessage({
+        type: 'result',
+        ok: true,
+        model: MODEL_NAME,
+        mask,
+        width: image.width,
+        height: image.height,
+      }, [mask.buffer]);
+    } catch (err) {
+      self.postMessage({
+        type: 'result',
+        ok: false,
+        error: String(err && err.stack || err),
+      });
+    }
+  };
+`;
+
+async function getBEN2Capability() {
+  const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (isMobile) return { available: false, reason: 'mobile device' };
+  if (!navigator.gpu) return { available: false, reason: 'WebGPU unavailable' };
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) return { available: false, reason: 'no WebGPU adapter' };
+    if (!adapter.features.has('shader-f16')) {
+      return { available: false, reason: 'WebGPU fp16 unavailable' };
+    }
+    return { available: true, reason: null };
+  } catch (_) {
+    return { available: false, reason: 'WebGPU probe failed' };
+  }
+}
+
+async function removeBackgroundWithBEN2(src, width, height) {
+  const capability = await getBEN2Capability();
+  if (!capability.available) {
+    console.log('[foto:bg] quality model skipped', {
+      model: 'ben2-fp16-webgpu',
+      reason: capability.reason,
+    });
+    return null;
+  }
+
+  const url = URL.createObjectURL(new Blob([BEN2_WORKER_SRC], { type: 'text/javascript' }));
+  const worker = new Worker(url);
+  URL.revokeObjectURL(url);
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      worker.terminate();
+      callback(value);
+    };
+    const timeout = setTimeout(
+      () => finish(reject, new Error('BEN2 timed out')),
+      120000
+    );
+
+    worker.onmessage = e => {
+      if (e.data.type === 'diagnostic') {
+        const method = e.data.level === 'error' ? 'error' : 'log';
+        console[method]('[foto:bg] ' + e.data.message, e.data.details);
+        return;
+      }
+      if (e.data.type !== 'result') return;
+      e.data.ok
+        ? finish(resolve, e.data)
+        : finish(reject, new Error(e.data.error));
+    };
+    worker.onerror = e => finish(reject, new Error(e.message || 'BEN2 worker failed'));
+    worker.postMessage({ src, width, height });
+  });
+}
+
 // Portrait-first background removal. RVM MobileNetV3 is small enough for
 // single-threaded WASM on iPhone; quantized MODNet remains the recovery path.
 const WORKER_SRC = `
@@ -779,12 +902,20 @@ async function makeCutout() {
   cctx.drawImage(img, 0, 0, width, height);
   const id = cctx.getImageData(0, 0, width, height);
   console.log('[foto:bg] removal requested', { width, height });
-  const result = await removeBackgroundInWorker(
-    state.originalSrc,
-    id.data,
-    width,
-    height
-  );
+  let result = null;
+  try {
+    result = await removeBackgroundWithBEN2(state.originalSrc, width, height);
+  } catch (err) {
+    console.error('[foto:bg] quality model failed; continuing with current pipeline', err);
+  }
+  if (!result) {
+    result = await removeBackgroundInWorker(
+      state.originalSrc,
+      id.data,
+      width,
+      height
+    );
+  }
   if (result.width !== width || result.height !== height) {
     throw new Error('Unexpected background-removal dimensions');
   }
