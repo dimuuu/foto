@@ -196,7 +196,7 @@ const P = {
   blur: 1.8,
   aberration: 0.012,
   spread: 6.0,
-  radial: 1.0,     // radial falloff of spread amount
+  radial: 1.0,     // displacement rises from the control center to its edge
   angle: 0.0,      // horizontal tear
   grain: 0.09,
   grainsize: 1.0,
@@ -231,6 +231,7 @@ const float BLUR = ${P.blur.toFixed(4)};
 const float ABERRATION = ${P.aberration.toFixed(4)};
 const float SPREAD = ${P.spread.toFixed(4)};
 const float RADIAL = ${P.radial.toFixed(4)};
+const float ANGLE = ${P.angle.toFixed(4)};
 const float GRAIN = ${P.grain.toFixed(4)};
 const float GRAINSIZE = ${P.grainsize.toFixed(4)};
 
@@ -240,11 +241,10 @@ float hash(vec2 p) {
   return fract((p3.x + p3.y) * p3.z);
 }
 
-// motion blur: gaussian-weighted line blur along the selected direction
-vec3 blurSample(vec2 uv, float amount) {
-  float blurAmount = BLUR * amount;
-  if (blurAmount < 0.01) return texture2D(u_image, uv).rgb;
-  vec2 dir = u_direction * blurAmount / u_res;
+// Global motion blur keeps the baked direction; the control only affects spread.
+vec3 blurSample(vec2 uv) {
+  if (BLUR < 0.01) return texture2D(u_image, uv).rgb;
+  vec2 dir = vec2(cos(ANGLE), sin(ANGLE)) * BLUR / u_res;
   vec3 c = vec3(0.0);
   float wsum = 0.0;
   for (int i = -4; i <= 4; i++) {
@@ -283,29 +283,27 @@ void main() {
   float radiusPx = max(1.0, u_radius * min(u_res.x, u_res.y));
   float range = length(fromCenterPx) / radiusPx;
 
-  // The tear grows away from the point, then eases cleanly to zero at the ring.
-  float radialRise = mix(1.0, smoothstep(0.0, 0.38, range), RADIAL);
-  float rangeFalloff = 1.0 - smoothstep(0.68, 1.0, range);
-  float effectAmount = radialRise * rangeFalloff;
-  float spreadAmt = SPREAD * effectAmount;
-  // Texture lookup runs opposite to perceived pixel motion, so invert the
-  // sampling axis to make the visible displacement follow the control.
-  vec2 axis = -normalize(u_direction);
+  // No displacement at the center; rise smoothly to full strength at the
+  // circle edge and keep full displacement everywhere outside the circle.
+  float displacementAmount = mix(1.0, smoothstep(0.0, 1.0, range), RADIAL);
+  float spreadAmt = SPREAD * displacementAmount;
+  vec2 axis = normalize(u_direction);
   vec2 perp = vec2(-axis.y, axis.x);
   float along = (hash(uv * u_res + vec2(seed, 0.0)) - 0.5) * 2.0;
   float across = (hash(uv * u_res + vec2(0.0, seed + 17.0)) - 0.5) * 2.0 * 0.2;
   vec2 suv = uv + (axis * along + perp * across) * spreadAmt * texel;
 
-  // Local chromatic aberration and blur use the same circular falloff.
-  vec2 d = suv - u_center;
-  float aberration = ABERRATION * effectAmount;
-  vec2 uvR = u_center + d * (1.0 - aberration);
-  vec2 uvB = u_center + d * (1.0 + aberration);
+  // Chromatic aberration, blur, tone, and grain remain global. The circle
+  // controls only the displacement amount above.
+  const vec2 imageCenter = vec2(0.5);
+  vec2 d = suv - imageCenter;
+  vec2 uvR = imageCenter + d * (1.0 - ABERRATION);
+  vec2 uvB = imageCenter + d * (1.0 + ABERRATION);
 
   // desaturate before recombining so fringes stay colored on the b&w base
-  vec3 sR = blurSample(uvR, effectAmount);
-  vec3 sG = blurSample(suv, effectAmount);
-  vec3 sB = blurSample(uvB, effectAmount);
+  vec3 sR = blurSample(uvR);
+  vec3 sG = blurSample(suv);
+  vec3 sB = blurSample(uvB);
   const vec3 W = vec3(0.299, 0.587, 0.114);
   vec3 col = mix(
     vec3(sR.r, sG.g, sB.b),
