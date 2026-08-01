@@ -196,7 +196,7 @@ const P = {
   blur: 1.8,
   aberration: 0.012,
   spread: 6.0,
-  radial: 1.0,     // displacement rises from the control center to its edge
+  radial: 1.0,     // the control circle protects its interior from displacement
   angle: 0.0,      // horizontal tear
   grain: 0.09,
   grainsize: 1.0,
@@ -283,9 +283,10 @@ void main() {
   float radiusPx = max(1.0, u_radius * min(u_res.x, u_res.y));
   float range = length(fromCenterPx) / radiusPx;
 
-  // No displacement at the center; rise smoothly to full strength at the
-  // circle edge and keep full displacement everywhere outside the circle.
-  float displacementAmount = mix(1.0, smoothstep(0.0, 1.0, range), RADIAL);
+  // The whole circle is a protected zone. Displacement starts at zero just
+  // outside its edge, then ramps to full strength over 45% of the radius.
+  float outsideRange = max(range - 1.0, 0.0);
+  float displacementAmount = mix(1.0, smoothstep(0.0, 0.45, outsideRange), RADIAL);
   float spreadAmt = SPREAD * displacementAmount;
   vec2 axis = normalize(u_direction);
   vec2 perp = vec2(-axis.y, axis.x);
