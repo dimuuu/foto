@@ -379,7 +379,7 @@ const directionHandle = document.getElementById('directionHandle');
 const radiusHandle = document.getElementById('radiusHandle');
 const fileInput = document.getElementById('file');
 const compareButton = document.getElementById('compare');
-const MAX_IMAGE_DIMENSION = 1080;
+const PROCESSING_SHORT_SIDE = 1080;
 
 function compile(type, src) {
   const s = gl.createShader(type);
@@ -436,8 +436,10 @@ const state = {
   seed: 1.0,
   bypass: false,
   hasImage: false,
-  originalSrc: null,   // data URL of the uploaded image
+  originalSrc: null,   // processing-sized version of the uploaded image
   cutoutSrc: null,     // cached bg-removed version (light background)
+  exportWidth: null,
+  exportHeight: null,
   backgroundModel: null,
   loading: false,
   time: 0,
@@ -465,22 +467,34 @@ function render() {
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
 
-function resizeImageForProcessing(src) {
+function prepareImageForProcessing(src) {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
-      const largestDimension = Math.max(img.naturalWidth, img.naturalHeight);
-      if (largestDimension <= MAX_IMAGE_DIMENSION) {
-        resolve(src);
+      const width = img.naturalWidth;
+      const height = img.naturalHeight;
+      const shortestSide = Math.max(1, Math.min(width, height));
+      const processingScale = PROCESSING_SHORT_SIDE / shortestSide;
+      const exportScale = Math.min(1, processingScale);
+      const processingWidth = Math.max(1, Math.round(width * processingScale));
+      const processingHeight = Math.max(1, Math.round(height * processingScale));
+      const exportWidth = Math.max(1, Math.round(width * exportScale));
+      const exportHeight = Math.max(1, Math.round(height * exportScale));
+
+      if (processingWidth === width && processingHeight === height) {
+        resolve({ src, exportWidth, exportHeight });
         return;
       }
 
-      const scale = MAX_IMAGE_DIMENSION / largestDimension;
       const resized = document.createElement('canvas');
-      resized.width = Math.max(1, Math.round(img.naturalWidth * scale));
-      resized.height = Math.max(1, Math.round(img.naturalHeight * scale));
-      resized.getContext('2d').drawImage(img, 0, 0, resized.width, resized.height);
-      resolve(resized.toDataURL('image/png'));
+      resized.width = processingWidth;
+      resized.height = processingHeight;
+      resized.getContext('2d').drawImage(img, 0, 0, processingWidth, processingHeight);
+      resolve({
+        src: resized.toDataURL('image/png'),
+        exportWidth,
+        exportHeight,
+      });
     };
     img.onerror = () => reject(new Error('Could not decode image'));
     img.src = src;
@@ -523,12 +537,14 @@ function handleFile(file) {
   const reader = new FileReader();
   reader.onload = async e => {
     try {
-      const resizedSrc = await resizeImageForProcessing(e.target.result);
+      const prepared = await prepareImageForProcessing(e.target.result);
       if (generation !== imageLoadGeneration) return;
       cancelControlDrag();
       stopLoadingFx();
-      state.originalSrc = resizedSrc;
+      state.originalSrc = prepared.src;
       state.cutoutSrc = null;
+      state.exportWidth = prepared.exportWidth;
+      state.exportHeight = prepared.exportHeight;
       state.backgroundModel = null;
       state.center = [...DEFAULT_CENTER];
       state.direction = [...DEFAULT_DIRECTION];
@@ -891,6 +907,8 @@ document.getElementById('restart').addEventListener('click', () => {
   compareButton.disabled = true;
   state.originalSrc = null;
   state.cutoutSrc = null;
+  state.exportWidth = null;
+  state.exportHeight = null;
   state.backgroundModel = null;
   state.center = [...DEFAULT_CENTER];
   state.direction = [...DEFAULT_DIRECTION];
@@ -1235,7 +1253,14 @@ document.addEventListener('visibilitychange', () => {
 document.getElementById('save').addEventListener('click', () => {
   if (!state.hasImage) return;
   render();
-  canvas.toBlob(blob => {
+  let output = canvas;
+  if (canvas.width !== state.exportWidth || canvas.height !== state.exportHeight) {
+    output = document.createElement('canvas');
+    output.width = state.exportWidth;
+    output.height = state.exportHeight;
+    output.getContext('2d').drawImage(canvas, 0, 0, output.width, output.height);
+  }
+  output.toBlob(blob => {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = 'foto-export.png';
