@@ -541,7 +541,8 @@ const BEN2_WORKER_SRC = `
       });
 
       const output = await segmenter(e.data.src);
-      const image = output && output[0];
+      // transformers v4 returns a single RawImage; v3 returned an array
+      const image = Array.isArray(output) ? output[0] : output;
       if (!image || image.channels !== 4) {
         throw new Error('Unexpected BEN2 output');
       }
