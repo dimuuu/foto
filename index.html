@@ -606,7 +606,10 @@ async function makeCutout() {
   out.width = width;
   out.height = height;
   const octx = out.getContext('2d');
-  octx.fillStyle = '#e2e2e2';
+  const background = octx.createLinearGradient(0, 0, 0, height);
+  background.addColorStop(0, '#d8d8d8');
+  background.addColorStop(1, '#c8c8c8');
+  octx.fillStyle = background;
   octx.fillRect(0, 0, width, height);
   octx.drawImage(cut, 0, 0);
   return out.toDataURL('image/png');
