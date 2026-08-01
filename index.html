@@ -315,6 +315,7 @@ const state = {
   hasImage: false,
   originalSrc: null,   // data URL of the uploaded image
   cutoutSrc: null,     // cached bg-removed version (light background)
+  backgroundModel: null,
   loading: false,
   time: 0,
   ampScale: 1,
@@ -359,6 +360,10 @@ function resizeImageForProcessing(src) {
 function loadImage(src) {
   const img = new Image();
   img.onload = () => {
+    const expectedSrc = bgCheckbox.checked && state.cutoutSrc
+      ? state.cutoutSrc
+      : state.originalSrc;
+    if (!expectedSrc || src !== expectedSrc) return;
     canvas.width = img.naturalWidth;
     canvas.height = img.naturalHeight;
     gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -381,6 +386,7 @@ function handleFile(file) {
     try {
       state.originalSrc = await resizeImageForProcessing(e.target.result);
       state.cutoutSrc = null;
+      state.backgroundModel = null;
       state.pointSet = false;
       bgCheckbox.checked = false;
       loadImage(state.originalSrc);
@@ -391,128 +397,133 @@ function handleFile(file) {
   reader.readAsDataURL(file);
 }
 
-// --- background removal (local in-browser models, transformers.js)
+// --- background removal (local in-browser portrait matting)
 const bgToggle = document.getElementById('bgToggle');
 const bgLabel = bgToggle.querySelector('span');
 const bgCheckbox = document.getElementById('removebg');
 
-// ORMBG fp16 on real WebGPU. iOS uses a smaller, single-threaded legacy
-// MODNet runtime because Transformers.js v3 can exhaust Mobile Safari memory.
+// Portrait-first background removal. RVM MobileNetV3 is small enough for
+// single-threaded WASM on iPhone; quantized MODNet remains the recovery path.
 const WORKER_SRC = `
-  const V3_URL = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm';
-  const IOS_URL = 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.15.1/dist/transformers.min.js';
-  const MODEL_REVISION = 'fa2fa546052fba4c08921230a26cc69a333fca12';
-  const ORMBG = {
-    name: 'ormbg',
-    id: 'onnx-community/ormbg-ONNX',
-    options: {
-      device: 'webgpu',
-      dtype: 'fp16',
-      revision: '034e2d884afbab897e10e78fc5bb566b29533fd6',
-    },
-  };
-  const MODNET = {
-    name: 'modnet',
-    id: 'Xenova/modnet',
-    options: { device: 'wasm', dtype: 'q8', revision: MODEL_REVISION },
-  };
-
-  function detectIOS() {
-    return /iPad|iPhone|iPod/.test(self.navigator.userAgent) ||
-      (self.navigator.platform === 'MacIntel' && self.navigator.maxTouchPoints > 1);
-  }
-  const IS_IOS = detectIOS();
+  const TFJS_URL = 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js';
+  const TFJS_WASM_URL = 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js';
+  const TFJS_WASM_PATH = 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/';
+  const TRANSFORMERS_URL = 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.15.1/dist/transformers.min.js';
+  const MODNET_REVISION = 'fa2fa546052fba4c08921230a26cc69a333fca12';
+  const RVM_NAME = 'rvm-mobilenetv3';
   let runnerPromise = null;
 
-  async function hasWebGPU() {
-    if (!self.navigator.gpu) return false;
-    try { return !!(await self.navigator.gpu.requestAdapter()); }
-    catch (e) { return false; }
-  }
+  async function loadRVMRunner(modelURL) {
+    importScripts(TFJS_URL);
+    importScripts(TFJS_WASM_URL);
+    tf.wasm.setWasmPaths(TFJS_WASM_PATH);
+    tf.wasm.setThreadsCount(1);
+    await tf.setBackend('wasm');
+    await tf.ready();
+    const model = await tf.loadGraphModel(modelURL);
 
-  function alphaFromCutout(cutout, width, height) {
-    if (cutout.channels === 1) return cutout.data;
-    if (cutout.channels !== 4) throw new Error('Unexpected background-removal output');
-    const mask = new Uint8ClampedArray(width * height);
-    for (let i = 0; i < mask.length; i++) mask[i] = cutout.data[i * 4 + 3];
-    return mask;
-  }
-
-  async function loadV3Runner(config) {
-    const { pipeline, RawImage } = await import(V3_URL);
-    const segmenter = await pipeline('background-removal', config.id, config.options);
     return {
-      name: config.name,
-      dispose: () => segmenter.dispose(),
-      run: async src => {
-        const image = await RawImage.fromURL(src);
-        const output = await segmenter(image);
-        let cutout = output[0];
-        if (cutout.width !== image.width || cutout.height !== image.height) {
-          cutout = await cutout.resize(image.width, image.height);
+      name: RVM_NAME,
+      dispose: () => model.dispose(),
+      run: async request => {
+        const width = request.width;
+        const height = request.height;
+        let source = null;
+        let src = null;
+        let ratio = null;
+        let recurrent = [];
+        let outputs = [];
+        let alphaTensor = null;
+
+        try {
+          source = tf.tensor3d(
+            new Uint8Array(request.pixels),
+            [height, width, 4],
+            'int32'
+          );
+          src = tf.tidy(() => source
+            .slice([0, 0, 0], [height, width, 3])
+            .toFloat()
+            .div(255)
+            .expandDims(0));
+          source.dispose();
+          source = null;
+
+          recurrent = [tf.scalar(0), tf.scalar(0), tf.scalar(0), tf.scalar(0)];
+          const shortestSide = Math.max(1, Math.min(width, height));
+          ratio = tf.scalar(Math.min(1, 256 / shortestSide));
+          outputs = await model.executeAsync(
+            {
+              src,
+              r1i: recurrent[0],
+              r2i: recurrent[1],
+              r3i: recurrent[2],
+              r4i: recurrent[3],
+              downsample_ratio: ratio,
+            },
+            ['fgr', 'pha', 'r1o', 'r2o', 'r3o', 'r4o']
+          );
+
+          alphaTensor = tf.tidy(() => outputs[1]
+            .squeeze(0)
+            .squeeze(-1)
+            .mul(255)
+            .clipByValue(0, 255)
+            .cast('int32'));
+          const mask = new Uint8ClampedArray(await alphaTensor.data());
+          if (mask.length !== width * height) throw new Error('Unexpected RVM output');
+          return { mask, width, height };
+        } finally {
+          if (alphaTensor) alphaTensor.dispose();
+          tf.dispose([source, src, ratio, ...recurrent, ...outputs].filter(Boolean));
         }
-        return {
-          mask: alphaFromCutout(cutout, image.width, image.height),
-          width: image.width,
-          height: image.height,
-        };
       },
     };
   }
 
-  async function loadIOSRunner() {
-    const { env, AutoModel, AutoProcessor, RawImage } = await import(IOS_URL);
+  async function loadMODNetRunner() {
+    const { env, AutoModel, AutoProcessor, RawImage } = await import(TRANSFORMERS_URL);
     if (env.backends && env.backends.onnx && env.backends.onnx.wasm) {
       env.backends.onnx.wasm.numThreads = 1;
       env.backends.onnx.wasm.proxy = false;
     }
     const [model, processor] = await Promise.all([
-      AutoModel.from_pretrained(MODNET.id, {
+      AutoModel.from_pretrained('Xenova/modnet', {
         quantized: true,
-        revision: MODEL_REVISION,
+        revision: MODNET_REVISION,
       }),
-      AutoProcessor.from_pretrained(MODNET.id, { revision: MODEL_REVISION }),
+      AutoProcessor.from_pretrained('Xenova/modnet', { revision: MODNET_REVISION }),
     ]);
     return {
-      name: 'modnet-ios',
-      run: async src => {
-        const image = await RawImage.fromURL(src);
+      name: 'modnet-fallback',
+      run: async request => {
+        const image = await RawImage.fromURL(request.src);
         const { pixel_values } = await processor(image);
         const { output } = await model({ input: pixel_values });
         const matte = await RawImage.fromTensor(output[0].mul(255).to('uint8'))
           .resize(image.width, image.height);
-        return {
-          mask: matte.data,
-          width: image.width,
-          height: image.height,
-        };
+        return { mask: matte.data, width: image.width, height: image.height };
       },
     };
   }
 
-  function getRunner() {
+  function getRunner(modelURL) {
     if (!runnerPromise) {
-      runnerPromise = (async () => {
-        if (IS_IOS) return loadIOSRunner();
-        if (await hasWebGPU()) {
-          try { return await loadV3Runner(ORMBG); } catch (e) { /* fall through */ }
-        }
-        return loadV3Runner(MODNET);
-      })();
+      runnerPromise = loadRVMRunner(modelURL).catch(() => loadMODNetRunner());
     }
     return runnerPromise;
   }
 
-  async function removeBackground(src) {
-    let runner = await getRunner();
+  async function removeBackground(request) {
+    let runner = await getRunner(request.modelURL);
     try {
-      return { ...(await runner.run(src)), model: runner.name };
+      return { ...(await runner.run(request)), model: runner.name };
     } catch (err) {
-      if (runner.name !== ORMBG.name) throw err;
+      if (runner.name !== RVM_NAME) throw err;
       try { await runner.dispose(); } catch (e) { /* best effort */ }
-      runnerPromise = loadV3Runner(MODNET);
+      runnerPromise = loadMODNetRunner();
       runner = await runnerPromise;
-      return { ...(await runner.run(src)), model: runner.name };
+      return { ...(await runner.run(request)), model: runner.name };
     }
   }
 
@@ -530,10 +541,10 @@ function resetBackgroundWorker() {
   if (bgWorker) bgWorker.terminate();
   bgWorker = null;
 }
-function removeBackgroundInWorker(src) {
+function removeBackgroundInWorker(src, pixels, width, height) {
   if (!bgWorker) {
     const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' }));
-    bgWorker = new Worker(url, { type: 'module' });
+    bgWorker = new Worker(url);
     URL.revokeObjectURL(url);
   }
   return new Promise((resolve, reject) => {
@@ -551,7 +562,13 @@ function removeBackgroundInWorker(src) {
       e.data.ok ? resolve(e.data) : fail(new Error(e.data.error));
     };
     bgWorker.onerror = e => fail(new Error(e.message || 'worker failed'));
-    bgWorker.postMessage(src);
+    bgWorker.postMessage({
+      src,
+      pixels: pixels.buffer,
+      width,
+      height,
+      modelURL: new URL('models/rvm/model.json', location.href).href,
+    });
   });
 }
 
@@ -588,18 +605,29 @@ function stopLoadingFx() {
 
 async function makeCutout() {
   bgLabel.textContent = 'Removing background…';
-  const { mask, width, height } = await removeBackgroundInWorker(state.originalSrc);
   const img = new Image();
   img.src = state.originalSrc;
   await img.decode();
-  // apply the matte as the alpha channel
+  const width = img.naturalWidth;
+  const height = img.naturalHeight;
   const cut = document.createElement('canvas');
   cut.width = width;
   cut.height = height;
   const cctx = cut.getContext('2d');
   cctx.drawImage(img, 0, 0, width, height);
   const id = cctx.getImageData(0, 0, width, height);
-  for (let i = 0; i < mask.length; i++) id.data[i * 4 + 3] = mask[i];
+  const result = await removeBackgroundInWorker(
+    state.originalSrc,
+    id.data,
+    width,
+    height
+  );
+  if (result.width !== width || result.height !== height) {
+    throw new Error('Unexpected background-removal dimensions');
+  }
+  state.backgroundModel = result.model;
+  // apply the matte as the alpha channel
+  for (let i = 0; i < result.mask.length; i++) id.data[i * 4 + 3] = result.mask[i];
   cctx.putImageData(id, 0, 0);
   // composite onto the light background
   const out = document.createElement('canvas');
@@ -623,7 +651,12 @@ bgCheckbox.addEventListener('change', async () => {
     startLoadingFx();
     try {
       const cutout = await makeCutout();
-      if (state.originalSrc !== srcAtStart) return; // restarted mid-run
+      if (state.originalSrc !== srcAtStart) {
+        bgToggle.classList.remove('busy');
+        bgLabel.textContent = 'Remove background';
+        stopLoadingFx();
+        return;
+      }
       state.cutoutSrc = cutout;
     } catch (err) {
       console.error(err);
@@ -646,6 +679,7 @@ document.getElementById('restart').addEventListener('click', () => {
   state.hasImage = false;
   state.originalSrc = null;
   state.cutoutSrc = null;
+  state.backgroundModel = null;
   state.pointSet = false;
   bgCheckbox.checked = false;
   bgToggle.classList.remove('busy');
