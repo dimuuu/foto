@@ -396,11 +396,12 @@ const bgToggle = document.getElementById('bgToggle');
 const bgLabel = bgToggle.querySelector('span');
 const bgCheckbox = document.getElementById('removebg');
 
-// ORMBG fp16 on WebGPU, with quantized MODNet on WASM as the compatibility
-// fallback. Both run in a worker and return an alpha mask at image size.
+// ORMBG fp16 on real WebGPU. iOS uses a smaller, single-threaded legacy
+// MODNet runtime because Transformers.js v3 can exhaust Mobile Safari memory.
 const WORKER_SRC = `
-  import { pipeline, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm';
-
+  const V3_URL = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm';
+  const IOS_URL = 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.15.1/dist/transformers.min.js';
+  const MODEL_REVISION = 'fa2fa546052fba4c08921230a26cc69a333fca12';
   const ORMBG = {
     name: 'ormbg',
     id: 'onnx-community/ormbg-ONNX',
@@ -413,74 +414,122 @@ const WORKER_SRC = `
   const MODNET = {
     name: 'modnet',
     id: 'Xenova/modnet',
-    options: {
-      device: 'wasm',
-      dtype: 'q8',
-      revision: 'fa2fa546052fba4c08921230a26cc69a333fca12',
-    },
+    options: { device: 'wasm', dtype: 'q8', revision: MODEL_REVISION },
   };
 
+  function detectIOS() {
+    return /iPad|iPhone|iPod/.test(self.navigator.userAgent) ||
+      (self.navigator.platform === 'MacIntel' && self.navigator.maxTouchPoints > 1);
+  }
+  const IS_IOS = detectIOS();
   let runnerPromise = null;
 
-  async function loadRunner(config) {
+  async function hasWebGPU() {
+    if (!self.navigator.gpu) return false;
+    try { return !!(await self.navigator.gpu.requestAdapter()); }
+    catch (e) { return false; }
+  }
+
+  function alphaFromCutout(cutout, width, height) {
+    if (cutout.channels === 1) return cutout.data;
+    if (cutout.channels !== 4) throw new Error('Unexpected background-removal output');
+    const mask = new Uint8ClampedArray(width * height);
+    for (let i = 0; i < mask.length; i++) mask[i] = cutout.data[i * 4 + 3];
+    return mask;
+  }
+
+  async function loadV3Runner(config) {
+    const { pipeline, RawImage } = await import(V3_URL);
     const segmenter = await pipeline('background-removal', config.id, config.options);
-    return { segmenter, name: config.name };
+    return {
+      name: config.name,
+      dispose: () => segmenter.dispose(),
+      run: async src => {
+        const image = await RawImage.fromURL(src);
+        const output = await segmenter(image);
+        let cutout = output[0];
+        if (cutout.width !== image.width || cutout.height !== image.height) {
+          cutout = await cutout.resize(image.width, image.height);
+        }
+        return {
+          mask: alphaFromCutout(cutout, image.width, image.height),
+          width: image.width,
+          height: image.height,
+        };
+      },
+    };
+  }
+
+  async function loadIOSRunner() {
+    const { env, AutoModel, AutoProcessor, RawImage } = await import(IOS_URL);
+    if (env.backends && env.backends.onnx && env.backends.onnx.wasm) {
+      env.backends.onnx.wasm.numThreads = 1;
+      env.backends.onnx.wasm.proxy = false;
+    }
+    const [model, processor] = await Promise.all([
+      AutoModel.from_pretrained(MODNET.id, {
+        quantized: true,
+        revision: MODEL_REVISION,
+      }),
+      AutoProcessor.from_pretrained(MODNET.id, { revision: MODEL_REVISION }),
+    ]);
+    return {
+      name: 'modnet-ios',
+      run: async src => {
+        const image = await RawImage.fromURL(src);
+        const { pixel_values } = await processor(image);
+        const { output } = await model({ input: pixel_values });
+        const matte = await RawImage.fromTensor(output[0].mul(255).to('uint8'))
+          .resize(image.width, image.height);
+        return {
+          mask: matte.data,
+          width: image.width,
+          height: image.height,
+        };
+      },
+    };
   }
 
   function getRunner() {
     if (!runnerPromise) {
       runnerPromise = (async () => {
-        if (self.navigator && self.navigator.gpu) {
-          try { return await loadRunner(ORMBG); } catch (e) { /* fall through */ }
+        if (IS_IOS) return loadIOSRunner();
+        if (await hasWebGPU()) {
+          try { return await loadV3Runner(ORMBG); } catch (e) { /* fall through */ }
         }
-        return loadRunner(MODNET);
+        return loadV3Runner(MODNET);
       })();
     }
     return runnerPromise;
   }
 
-  async function removeBackground(image) {
+  async function removeBackground(src) {
     let runner = await getRunner();
     try {
-      return { output: await runner.segmenter(image), model: runner.name };
+      return { ...(await runner.run(src)), model: runner.name };
     } catch (err) {
       if (runner.name !== ORMBG.name) throw err;
-      try { await runner.segmenter.dispose(); } catch (e) { /* best effort */ }
-      runnerPromise = loadRunner(MODNET);
+      try { await runner.dispose(); } catch (e) { /* best effort */ }
+      runnerPromise = loadV3Runner(MODNET);
       runner = await runnerPromise;
-      return { output: await runner.segmenter(image), model: runner.name };
+      return { ...(await runner.run(src)), model: runner.name };
     }
   }
 
   self.onmessage = async e => {
     try {
-      const image = await RawImage.fromURL(e.data);
-      const { output, model } = await removeBackground(image);
-      let cutout = output[0];
-      if (cutout.width !== image.width || cutout.height !== image.height) {
-        cutout = await cutout.resize(image.width, image.height);
-      }
-
-      let mask;
-      if (cutout.channels === 4) {
-        mask = new Uint8ClampedArray(image.width * image.height);
-        for (let i = 0; i < mask.length; i++) mask[i] = cutout.data[i * 4 + 3];
-      } else if (cutout.channels === 1) {
-        mask = cutout.data;
-      } else {
-        throw new Error('Unexpected background-removal output');
-      }
-
-      self.postMessage(
-        { ok: true, mask, width: image.width, height: image.height, model },
-        [mask.buffer]
-      );
+      const result = await removeBackground(e.data);
+      self.postMessage({ ok: true, ...result }, [result.mask.buffer]);
     } catch (err) {
       self.postMessage({ ok: false, error: String(err && err.stack || err) });
     }
   };
 `;
 let bgWorker = null;
+function resetBackgroundWorker() {
+  if (bgWorker) bgWorker.terminate();
+  bgWorker = null;
+}
 function removeBackgroundInWorker(src) {
   if (!bgWorker) {
     const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' }));
@@ -488,8 +537,20 @@ function removeBackgroundInWorker(src) {
     URL.revokeObjectURL(url);
   }
   return new Promise((resolve, reject) => {
-    bgWorker.onmessage = e => e.data.ok ? resolve(e.data) : reject(new Error(e.data.error));
-    bgWorker.onerror = e => reject(new Error(e.message || 'worker failed'));
+    const fail = error => {
+      clearTimeout(timeout);
+      resetBackgroundWorker();
+      reject(error);
+    };
+    const timeout = setTimeout(
+      () => fail(new Error('Background removal timed out')),
+      180000
+    );
+    bgWorker.onmessage = e => {
+      clearTimeout(timeout);
+      e.data.ok ? resolve(e.data) : fail(new Error(e.data.error));
+    };
+    bgWorker.onerror = e => fail(new Error(e.message || 'worker failed'));
     bgWorker.postMessage(src);
   });
 }
