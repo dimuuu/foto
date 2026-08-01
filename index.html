@@ -177,7 +177,7 @@
 </div>
 
 <div id="bar">
-  <div class="hint">Drag the circle, dot, and corner to adjust. Hold B to compare.</div>
+  <div class="hint">Hold B to compare.</div>
   <label class="toggle" id="bgToggle">
     <input type="checkbox" id="removebg">
     <span>Remove background</span>
@@ -215,6 +215,7 @@ const FRAG = `
 precision highp float;
 varying vec2 v_uv;
 uniform sampler2D u_image;
+uniform sampler2D u_original;
 uniform vec2 u_res;
 uniform vec2 u_center;
 uniform vec2 u_direction;
@@ -261,7 +262,7 @@ void main() {
   vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
 
   if (u_bypass > 0.5) {
-    gl_FragColor = vec4(texture2D(u_image, uv).rgb, 1.0);
+    gl_FragColor = vec4(texture2D(u_original, uv).rgb, 1.0);
     return;
   }
 
@@ -364,15 +365,23 @@ gl.enableVertexAttribArray(aPos);
 gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
 const U = {};
-['u_res','u_center','u_direction','u_radius','u_seed','u_bypass','u_loading','u_time','u_ampscale']
+['u_image','u_original','u_res','u_center','u_direction','u_radius','u_seed','u_bypass','u_loading','u_time','u_ampscale']
   .forEach(n => U[n] = gl.getUniformLocation(prog, n));
 
-const texture = gl.createTexture();
-gl.bindTexture(gl.TEXTURE_2D, texture);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+function createTexture(unit) {
+  const value = gl.createTexture();
+  gl.activeTexture(unit);
+  gl.bindTexture(gl.TEXTURE_2D, value);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  return value;
+}
+const texture = createTexture(gl.TEXTURE0);
+const originalTexture = createTexture(gl.TEXTURE1);
+gl.uniform1i(U.u_image, 0);
+gl.uniform1i(U.u_original, 1);
 
 const DEFAULT_CENTER = [0.5, 0.42];
 const DEFAULT_DIRECTION = [Math.cos(P.angle), Math.sin(P.angle)];
@@ -401,6 +410,10 @@ let imageLoadGeneration = 0;
 
 function render() {
   if (!state.hasImage) return;
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, originalTexture);
   gl.viewport(0, 0, canvas.width, canvas.height);
   gl.uniform2f(U.u_res, canvas.width, canvas.height);
   gl.uniform2f(U.u_center, state.center[0], state.center[1]);
@@ -445,8 +458,14 @@ function loadImage(src) {
     if (!expectedSrc || src !== expectedSrc) return;
     canvas.width = img.naturalWidth;
     canvas.height = img.naturalHeight;
+    gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    if (src === state.originalSrc) {
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, originalTexture);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    }
     state.hasImage = true;
     document.body.classList.add('loaded');
     drop.classList.add('hidden');
@@ -504,8 +523,15 @@ const WORKER_SRC = `
   const MODNET_REVISION = 'fa2fa546052fba4c08921230a26cc69a333fca12';
   const RVM_NAME = 'rvm-mobilenetv3';
   let runnerPromise = null;
+  let diagnostics = [];
+
+  function debug(level, message, details = {}) {
+    diagnostics.push({ level, message, details });
+  }
 
   async function loadRVMRunner(modelURL) {
+    debug('log', 'loading primary model', { model: RVM_NAME });
+    const startedAt = performance.now();
     importScripts(TFJS_URL);
     importScripts(TFJS_WASM_URL);
     tf.wasm.setWasmPaths(TFJS_WASM_PATH);
@@ -513,6 +539,11 @@ const WORKER_SRC = `
     await tf.setBackend('wasm');
     await tf.ready();
     const model = await tf.loadGraphModel(modelURL);
+    debug('log', 'primary model ready', {
+      model: RVM_NAME,
+      backend: tf.getBackend(),
+      ms: Math.round(performance.now() - startedAt),
+    });
 
     return {
       name: RVM_NAME,
@@ -574,6 +605,8 @@ const WORKER_SRC = `
   }
 
   async function loadMODNetRunner() {
+    debug('log', 'loading fallback model', { model: 'modnet-fallback' });
+    const startedAt = performance.now();
     const { env, AutoModel, AutoProcessor, RawImage } = await import(TRANSFORMERS_URL);
     if (env.backends && env.backends.onnx && env.backends.onnx.wasm) {
       env.backends.onnx.wasm.numThreads = 1;
@@ -586,6 +619,11 @@ const WORKER_SRC = `
       }),
       AutoProcessor.from_pretrained('Xenova/modnet', { revision: MODNET_REVISION }),
     ]);
+    debug('log', 'fallback model ready', {
+      model: 'modnet-fallback',
+      backend: 'wasm',
+      ms: Math.round(performance.now() - startedAt),
+    });
     return {
       name: 'modnet-fallback',
       run: async request => {
@@ -601,30 +639,58 @@ const WORKER_SRC = `
 
   function getRunner(modelURL) {
     if (!runnerPromise) {
-      runnerPromise = loadRVMRunner(modelURL).catch(() => loadMODNetRunner());
+      runnerPromise = loadRVMRunner(modelURL).catch(err => {
+        debug('error', 'primary model failed to load; using fallback', {
+          error: String(err && err.stack || err),
+        });
+        return loadMODNetRunner();
+      });
     }
     return runnerPromise;
   }
 
   async function removeBackground(request) {
+    const startedAt = performance.now();
     let runner = await getRunner(request.modelURL);
     try {
-      return { ...(await runner.run(request)), model: runner.name };
+      const result = await runner.run(request);
+      debug('log', 'inference complete', {
+        model: runner.name,
+        width: request.width,
+        height: request.height,
+        ms: Math.round(performance.now() - startedAt),
+      });
+      return { ...result, model: runner.name };
     } catch (err) {
       if (runner.name !== RVM_NAME) throw err;
+      debug('error', 'primary inference failed; using fallback', {
+        error: String(err && err.stack || err),
+      });
       try { await runner.dispose(); } catch (e) { /* best effort */ }
       runnerPromise = loadMODNetRunner();
       runner = await runnerPromise;
-      return { ...(await runner.run(request)), model: runner.name };
+      const result = await runner.run(request);
+      debug('log', 'inference complete', {
+        model: runner.name,
+        width: request.width,
+        height: request.height,
+        ms: Math.round(performance.now() - startedAt),
+      });
+      return { ...result, model: runner.name };
     }
   }
 
   self.onmessage = async e => {
+    diagnostics = [];
     try {
       const result = await removeBackground(e.data);
-      self.postMessage({ ok: true, ...result }, [result.mask.buffer]);
+      self.postMessage({ ok: true, ...result, diagnostics }, [result.mask.buffer]);
     } catch (err) {
-      self.postMessage({ ok: false, error: String(err && err.stack || err) });
+      self.postMessage({
+        ok: false,
+        error: String(err && err.stack || err),
+        diagnostics,
+      });
     }
   };
 `;
@@ -651,6 +717,10 @@ function removeBackgroundInWorker(src, pixels, width, height) {
     );
     bgWorker.onmessage = e => {
       clearTimeout(timeout);
+      for (const entry of e.data.diagnostics || []) {
+        const method = entry.level === 'error' ? 'error' : 'log';
+        console[method]('[foto:bg] ' + entry.message, entry.details);
+      }
       e.data.ok ? resolve(e.data) : fail(new Error(e.data.error));
     };
     bgWorker.onerror = e => fail(new Error(e.message || 'worker failed'));
@@ -708,6 +778,7 @@ async function makeCutout() {
   const cctx = cut.getContext('2d');
   cctx.drawImage(img, 0, 0, width, height);
   const id = cctx.getImageData(0, 0, width, height);
+  console.log('[foto:bg] removal requested', { width, height });
   const result = await removeBackgroundInWorker(
     state.originalSrc,
     id.data,
@@ -718,6 +789,11 @@ async function makeCutout() {
     throw new Error('Unexpected background-removal dimensions');
   }
   state.backgroundModel = result.model;
+  console.log('[foto:bg] removal applied', {
+    model: result.model,
+    width: result.width,
+    height: result.height,
+  });
   // apply the matte as the alpha channel
   for (let i = 0; i < result.mask.length; i++) id.data[i * 4 + 3] = result.mask[i];
   cctx.putImageData(id, 0, 0);
